@@ -26,6 +26,9 @@ $backstage-bar-height: 43px;
 
 // Random variables
 $emoji-per-row: 9; // needs to match variable `EMOJI_PER_ROW` in components/emoji_picker/constants/index.ts
+$open-graph-thumbnail-size: 80px; // needs to match `OPEN_GRAPH_THUMBNAIL_SIZE` in components/post_view/post_attachment_opengraph/constants.ts
+$open-graph-max-image-width: 392px; // needs to match `OPEN_GRAPH_MAX_IMAGE_WIDTH` in components/post_view/post_attachment_opengraph/constants.ts
+$open-graph-max-image-height: 240px; // needs to match `OPEN_GRAPH_MAX_IMAGE_HEIGHT` in components/post_view/post_attachment_opengraph/constants.ts
 
 // Transition timing defaults
 $transition-quick: 0.12s;
