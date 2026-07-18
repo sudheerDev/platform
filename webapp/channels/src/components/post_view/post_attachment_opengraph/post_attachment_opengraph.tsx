@@ -159,6 +159,11 @@ const PostAttachmentOpenGraph = ({openGraphData, post, actions, link, isInPermal
             href={safeLink}
             title={openGraphData?.title || openGraphData?.url || link}
             location='post_attachment_opengraph'
+            style={{
+                '--open-graph-thumbnail-size': `${OPEN_GRAPH_THUMBNAIL_SIZE}px`,
+                '--open-graph-max-image-width': `${OPEN_GRAPH_MAX_IMAGE_WIDTH}px`,
+                '--open-graph-max-image-height': `${OPEN_GRAPH_MAX_IMAGE_HEIGHT}px`,
+            } as React.CSSProperties}
         >
             {rest.currentUserId === post.user_id && !isInPermalink && (
                 <WithTooltip
