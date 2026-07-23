@@ -143,6 +143,27 @@ export function unassignChannelsFromAccessControlPolicy(policyId: string, channe
     });
 }
 
+export function assignTeamsToAccessControlPolicy(policyId: string, teamIds: string[]) {
+    return bindClientFunc({
+        clientFunc: () => Client4.assignTeamsToAccessControlPolicy(policyId, teamIds),
+        params: [],
+    });
+}
+
+export function unassignTeamsFromAccessControlPolicy(policyId: string, teamIds: string[]) {
+    return bindClientFunc({
+        clientFunc: () => Client4.unassignTeamsFromAccessControlPolicy(policyId, teamIds),
+        params: [],
+    });
+}
+
+export function getTeamAccessControlPolicy(teamId: string) {
+    return bindClientFunc({
+        clientFunc: () => Client4.getTeamAccessControlPolicy(teamId),
+        params: [],
+    });
+}
+
 export function getAccessControlFields(after: string, limit: number, channelId?: string, teamId?: string) {
     return bindClientFunc({
         clientFunc: () => Client4.getAccessControlFields(after, limit, channelId, teamId),
@@ -224,6 +245,19 @@ export function createAccessControlSyncJob(jobData: {policy_id?: string; team_id
         let data;
         try {
             data = await Client4.createAccessControlSyncJob(jobData);
+        } catch (error) {
+            forceLogoutIfNecessary(error as ServerError, dispatch, getState);
+            return {error};
+        }
+        return {data};
+    };
+}
+
+export function createAccessControlTeamSyncJob(jobData: {policy_id?: string}): ActionFuncAsync<any> {
+    return async (dispatch, getState) => {
+        let data;
+        try {
+            data = await Client4.createAccessControlTeamSyncJob(jobData as {[key: string]: string});
         } catch (error) {
             forceLogoutIfNecessary(error as ServerError, dispatch, getState);
             return {error};

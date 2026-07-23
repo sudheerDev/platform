@@ -59,6 +59,7 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/migrations"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/mobile_session_metadata"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/notify_admin"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs/notify_expiring_access_tokens"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/plugins"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/post_persistent_notifications"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/product_notices"
@@ -66,6 +67,7 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/refresh_materialized_views"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/resend_invitation_email"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/s3_path_migration"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs/scheduled_recap"
 	"github.com/mattermost/mattermost/server/v8/channels/store"
 	"github.com/mattermost/mattermost/server/v8/channels/utils"
 	"github.com/mattermost/mattermost/server/v8/config"
@@ -265,6 +267,9 @@ func NewServer(options ...Option) (*Server, error) {
 			callerID, _ := CallerIDFromRequestContext(rctx)
 			return callerID
 		},
+		RequestOptionsExtractor: func(rctx request.CTX) model.PropertyRequestOptions {
+			return model.PropertyRequestOptionsFromContext(rctx.Context())
+		},
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to create properties service")
@@ -273,7 +278,9 @@ func NewServer(options ...Option) (*Server, error) {
 	// Register builtin property groups before creating hooks that reference them
 	if err = s.propertyService.RegisterBuiltinGroups([]*model.PropertyGroup{
 		{Name: model.AccessControlPropertyGroupName, Version: model.PropertyGroupVersionV2, SchemaVersion: model.AccessControlPropertyGroupSchemaVersion},
+		{Name: model.SessionAttributesPropertyGroupName, Version: model.PropertyGroupVersionV2},
 		{Name: model.ContentFlaggingGroupName, Version: model.PropertyGroupVersionV1},
+		{Name: model.BoardsPropertyGroupName, Version: model.PropertyGroupVersionV2},
 	}); err != nil {
 		return nil, errors.Wrap(err, "failed to register builtin property groups")
 	}
@@ -338,6 +345,12 @@ func NewServer(options ...Option) (*Server, error) {
 	attrValidationHook := properties.NewAccessControlAttributeValidationHook(s.propertyService, permChecker, cpaGroup.ID)
 	s.propertyService.AddHook(attrValidationHook)
 
+	// Generic property value audit hook — groups opt in with RegisterGroup.
+	// The CPA group registers a content-level audit sink here.
+	valueAuditHook := properties.NewPropertyValueAuditHook()
+	valueAuditHook.RegisterGroup(cpaGroup.ID, app.auditCPAValueChange)
+	s.propertyService.AddHook(valueAuditHook)
+
 	// Field limit hook — enforces per-object-type and global field limits.
 	// Only "user" has a per-type cap today; when channel/team/post CPA fields
 	// are added, set their per-type caps here. Until then
@@ -351,6 +364,13 @@ func NewServer(options ...Option) (*Server, error) {
 		GlobalLimit: model.AccessControlGroupFieldLimit,
 	})
 	s.propertyService.AddHook(fieldLimitHook)
+
+	// Session attributes schema guard — blocks deletion and restricts edits to the tunable Attrs.
+	saGroup, err := s.propertyService.Group(model.SessionAttributesPropertyGroupName)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to look up session attributes property group")
+	}
+	s.propertyService.AddHook(properties.NewSessionAttributesHook(s.propertyService, saGroup.ID))
 
 	// Type-change value cleanup — registered last so the field write has
 	// passed every other gate (license, access control, validation, limit)
@@ -874,6 +894,14 @@ func (s *Server) Go(f func()) {
 // to ensure that execution completes before the server is shutdown.
 func (s *Server) GoBuffered(f func()) {
 	s.platform.GoBuffered(f)
+}
+
+// GoExtraction submits f to the bounded document extraction worker pool without
+// blocking the caller. It returns false if the pool is saturated and f was not
+// run; skipped files stay unextracted until the scheduled ExtractContent catch-up
+// job or an admin runs a content extraction job (e.g. mmctl extract).
+func (s *Server) GoExtraction(f func()) bool {
+	return s.platform.GoExtraction(f)
 }
 
 var corsAllowedMethods = []string{
@@ -1546,7 +1574,7 @@ func (ch *Channels) ClientConfigHash() string {
 }
 
 func (s *Server) initJobs() {
-	s.Jobs = jobs.NewJobServer(s.platform, s.Store(), s.GetMetrics(), s.Log())
+	s.Jobs = jobs.NewJobServer(s.platform, s.Store(), s.GetMetrics(), s.Log(), s.platform.Publish)
 
 	if jobsDataRetentionJobInterface != nil {
 		builder := jobsDataRetentionJobInterface(s)
@@ -1576,6 +1604,11 @@ func (s *Server) initJobs() {
 	if jobsAccessControlSyncJobInterface != nil {
 		builder := jobsAccessControlSyncJobInterface(s)
 		s.Jobs.RegisterJobType(model.JobTypeAccessControlSync, builder.MakeWorker(), builder.MakeScheduler())
+	}
+
+	if jobsAccessControlTeamSyncJobInterface != nil {
+		builder := jobsAccessControlTeamSyncJobInterface(s)
+		s.Jobs.RegisterJobType(model.JobTypeAccessControlTeamSync, builder.MakeWorker(), builder.MakeScheduler())
 	}
 
 	if pushProxyInterface != nil {
@@ -1673,7 +1706,7 @@ func (s *Server) initJobs() {
 	s.Jobs.RegisterJobType(
 		model.JobTypeExtractContent,
 		extract_content.MakeWorker(s.Jobs, New(ServerConnector(s.Channels())), s.Store()),
-		nil,
+		extract_content.MakeScheduler(s.Jobs),
 	)
 
 	s.Jobs.RegisterJobType(
@@ -1726,8 +1759,14 @@ func (s *Server) initJobs() {
 
 	s.Jobs.RegisterJobType(
 		model.JobTypeCleanupExpiredAccessTokens,
-		cleanup_expired_access_tokens.MakeWorker(s.Jobs, s.platform.ClearUserSessionCache),
+		cleanup_expired_access_tokens.MakeWorker(s.Jobs, s.platform.ClearUserSessionCache, New(ServerConnector(s.Channels())).NotifyExpiredAccessTokensDeleted),
 		cleanup_expired_access_tokens.MakeScheduler(s.Jobs),
+	)
+
+	s.Jobs.RegisterJobType(
+		model.JobTypeNotifyExpiringAccessTokens,
+		notify_expiring_access_tokens.MakeWorker(s.Jobs, New(ServerConnector(s.Channels())).NotifyExpiringAccessTokens),
+		notify_expiring_access_tokens.MakeScheduler(s.Jobs),
 	)
 
 	s.Jobs.RegisterJobType(
@@ -1751,6 +1790,12 @@ func (s *Server) initJobs() {
 		model.JobTypeRecap,
 		recap.MakeWorker(s.Jobs, s.Store(), New(ServerConnector(s.Channels()))),
 		nil,
+	)
+
+	s.Jobs.RegisterJobType(
+		model.JobTypeScheduledRecap,
+		scheduled_recap.MakeWorker(s.Jobs, s.Store(), New(ServerConnector(s.Channels()))),
+		scheduled_recap.MakeScheduler(s.Jobs, s.Store()),
 	)
 
 	s.Jobs.RegisterJobType(

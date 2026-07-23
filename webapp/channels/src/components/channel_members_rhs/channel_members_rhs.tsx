@@ -4,12 +4,15 @@
 import debounce from 'lodash/debounce';
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {FormattedMessage, useIntl} from 'react-intl';
+import {useSelector} from 'react-redux';
 import {useHistory} from 'react-router-dom';
 
 import type {Channel} from '@mattermost/types/channels';
 import type {UserProfile} from '@mattermost/types/users';
 
 import {ProfilesInChannelSortBy} from 'mattermost-redux/actions/users';
+
+import {areChannelAccessControlIndicatorsEnabled} from 'selectors/general';
 
 import AlertBanner from 'components/alert_banner';
 import ChannelInviteModal from 'components/channel_invite_modal';
@@ -52,7 +55,7 @@ export interface Props {
         closeRightHandSide: () => void;
         goBack: () => void;
         setChannelMembersRhsSearchTerm: (terms: string) => void;
-        loadProfilesAndReloadChannelMembers: (page: number, perParge: number, channelId: string, sort: string) => void;
+        loadProfilesAndReloadChannelMembers: (page: number, perParge: number, channelId: string, sort: string, options?: Record<string, unknown>, reconcile?: boolean) => void;
         loadMyChannelMemberAndRole: (channelId: string) => void;
         setEditChannelMembers: (active: boolean) => void;
         searchProfilesAndChannelMembers: (term: string, options: any) => Promise<{data: UserProfile[]}>;
@@ -84,10 +87,14 @@ export default function ChannelMembersRHS({
     // tags in the RHS — a permission-only policy (e.g. file upload) has
     // no bearing on who can be a member.
     const isMembershipPolicy = isMembershipPolicyEnforced(channel);
+
+    // Admins can disable the attribute indicators to avoid leaking policy
+    // details; when off we skip fetching/rendering the tags entirely.
+    const indicatorsEnabled = useSelector(areChannelAccessControlIndicatorsEnabled);
     const {structuredAttributes, loading} = useAccessControlAttributes(
         EntityType.Channel,
         channel.id,
-        isMembershipPolicy,
+        isMembershipPolicy && indicatorsEnabled,
     );
 
     // Memoise the rendered access-control tags so they don't re-render on
@@ -189,7 +196,7 @@ export default function ChannelMembersRHS({
         setPage(0);
         setIsNextPageLoading(false);
         actions.setChannelMembersRhsSearchTerm('');
-        actions.loadProfilesAndReloadChannelMembers(0, USERS_PER_PAGE, channel.id, ProfilesInChannelSortBy.Admin);
+        actions.loadProfilesAndReloadChannelMembers(0, USERS_PER_PAGE, channel.id, ProfilesInChannelSortBy.Admin, {}, true);
         actions.loadMyChannelMemberAndRole(channel.id);
     }, [channel.id, channel.type]);
 
@@ -197,9 +204,9 @@ export default function ChannelMembersRHS({
         actions.setChannelMembersRhsSearchTerm(terms);
     };
 
-    const doSearch = useCallback(debounce(async (terms: string) => {
+    const doSearch = useMemo(() => debounce(async (terms: string) => {
         await actions.searchProfilesAndChannelMembers(terms, {in_team_id: channel.team_id, in_channel_id: channel.id});
-    }, Constants.SEARCH_TIMEOUT_MILLISECONDS), [actions.searchProfilesAndChannelMembers]);
+    }, Constants.SEARCH_TIMEOUT_MILLISECONDS), [actions.searchProfilesAndChannelMembers, channel]);
 
     useEffect(() => {
         if (searchTerms) {
